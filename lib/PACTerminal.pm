@@ -3162,18 +3162,20 @@ sub _splitNested {
     # Which slot do I occupy in the parent pane?
     my $in_child1 = ($parent_pane->get_child1() == $vbox_self);
 
-    # Remove my VBOX from the parent pane
+    # Remove my VBOX from the parent pane.
+    # The $vbox_self Perl scalar holds a GObject ref so the widget stays alive
+    # even after removal from its container.
     $parent_pane->remove($vbox_self);
 
-    # Detach partner from its notebook tab safely:
-    #   reparent to a temporary holder first (keeps refcount alive through remove_page)
-    my $holding_box   = Gtk3::VBox->new(0, 0);
-    my $partner_page  = $tabs->page_num($vbox_part);
-    $vbox_part->reparent($holding_box);
+    # Detach partner from its notebook tab using the GTK3-correct idiom:
+    #   remove() then add() rather than deprecated reparent().
+    # The $vbox_part Perl scalar keeps the GObject ref alive across remove_page.
+    my $partner_page = $tabs->page_num($vbox_part);
+    my $part_parent  = $vbox_part->get_parent();
+    $part_parent->remove($vbox_part) if defined $part_parent;
     $tabs->remove_page($partner_page) if $partner_page >= 0;
-    $holding_box->remove($vbox_part);  # detach before packing into new pane
 
-    # Build the new inner pane
+    # Build the new inner pane and add both VBOXes (both are now parentless)
     my $new_inner_pane = $vertical ? Gtk3::VPaned->new() : Gtk3::HPaned->new();
     $new_inner_pane->pack1($vbox_self,  1, 0);
     $new_inner_pane->pack2($vbox_part,  1, 0);
@@ -3420,9 +3422,23 @@ sub _unsplitNested {
         $grandparent->show_all();
     }
 
-    # Promote self to a new standalone tab
+    # Fix stale _SPLIT_VPANE on any terminal whose immediate pane was $parent_pane.
+    # Those terminals' _SPLIT_VPANE now points to the orphaned outer pane; update
+    # it to $sibling (the pane that took parent_pane's place in the layout).
+    if (ref($sibling) && $sibling->isa('Gtk3::Paned')) {
+        foreach my $uuid (keys %PACMain::RUNNING) {
+            my $t = $PACMain::RUNNING{$uuid}{terminal};
+            next unless defined $t && ref($t->{_SPLIT_VPANE});
+            if ($t->{_SPLIT_VPANE} == $parent_pane) {
+                $t->{_SPLIT_VPANE} = $sibling;
+            }
+        }
+    }
+
+    # Promote self to a new standalone tab using GTK3-correct remove/add idiom
     my $new_vbox = Gtk3::VBox->new(0, 0);
-    $my_vbox->reparent($new_vbox);
+    # $my_vbox is already parentless (removed above); add it to the wrapper directly
+    $new_vbox->add($my_vbox);
     $$self{_GUI}{_VBOX} = $new_vbox;
     $$self{_TABBED} = 1;
 
