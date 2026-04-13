@@ -115,6 +115,8 @@ sub new {
     $self->{_SPLIT_VPANE} = 0;
     $self->{_SPLIT_VERTICAL} = 0;
     $self->{_POST_SPLIT} = 0;
+    $self->{_SPLIT_OWNER}   = 0;   # UUID_TMP of tab owner, own UUID_TMP if owner, 0 if not split
+    $self->{_SPLIT_MEMBERS} = [];  # owner only: ordered list of all member UUID_TMPs incl self
     $self->{_PROPAGATE} = 1;
     $self->{_NO_UPDATE_CFG} = 0;
     $self->{_LAST_STATUS} = 'DISCONNECTED';
@@ -606,8 +608,10 @@ sub stop {
     # Finish the GUI
     if ($$self{_TABBED}) {
         my $p_num = -1;
-        if ($$self{_SPLIT}) {
-            $p_num = $$self{_NOTEBOOK}->page_num($p_widget->get_parent());
+        if ($$self{_SPLIT} || $$self{_SPLIT_OWNER}) {
+            # Nested or flat split: walk up the widget tree to find the notebook page
+            my $page_widget = $self->_findNotebookPageWidget($p_widget);
+            $p_num = defined $page_widget ? $$self{_NOTEBOOK}->page_num($page_widget) : -1;
         } else {
             $p_num = $$self{_NOTEBOOK}->page_num($p_widget);
         }
@@ -1195,6 +1199,12 @@ sub _setupCallbacks {
                     $self->_clusterCommit(undef, $cmd, undef);
                 }
             }
+        } elsif ($action eq 'split-h') {
+            $self->_splitWithAutoPartner(0) if $$self{_TABBED};
+        } elsif ($action eq 'split-v') {
+            $self->_splitWithAutoPartner(1) if $$self{_TABBED};
+        } elsif ($action eq 'unsplit') {
+            $self->_unsplit() if $$self{_SPLIT} || $$self{_SPLIT_OWNER};
         } elsif ($action eq 'cisco') {
             _vteFeedChildBinary($$self{_GUI}{_VTE}, "\c^x");
             #_vteFeedChildBinary($$self{_GUI}{_VTE}, "\c^");
@@ -1792,9 +1802,10 @@ sub _vteMenu {
             if ($uuid_tmp eq $$self{_UUID_TMP} || $PACMain::RUNNING{$uuid_tmp}{terminal}{_TITLE} eq 'Info ' || $i < 0) {
                 next;
             }
-            if (($$self{_SPLIT} || $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT}) || (! $PACMain::RUNNING{$uuid_tmp}{terminal}{_TABBED})) {
-                next;
-            }
+            # Only offer standalone (unsplit, tabbed) terminals as partners
+            next unless $PACMain::RUNNING{$uuid_tmp}{terminal}{_TABBED};
+            next if $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT};
+            next if $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT_OWNER};
             push(@submenu_split_v,
             {
                 label => "$i: $PACMain::RUNNING{$uuid_tmp}{terminal}{_TITLE}",
@@ -1827,12 +1838,12 @@ sub _vteMenu {
             }
         });
 
-        if ($$self{_SPLIT}) {
+        if ($$self{_SPLIT} || $$self{_SPLIT_OWNER}) {
             push(@vte_menu_items,
             {
                 label => 'Unsplit',
                 stockicon => 'gtk-zoom-fit',
-                tooltip => "Remove the split view and put each connection into its own tab",
+                tooltip => "Remove this terminal from the split view",
                 code => sub {
                     $self->_unsplit();
                 }
@@ -1846,29 +1857,29 @@ sub _vteMenu {
                     $self->_equalresize();
                 }
             });
-        } else {
-            push(@vte_menu_items,
-            {
-                label => 'Split',
-                stockicon => 'gtk-zoom-fit',
-                sensitive => scalar(@submenu_split_v) && scalar(@submenu_split_h),
-                submenu =>
-                [
-                    {
-                        label => 'Vertically',
-                        stockicon => 'gtk-zoom-fit',
-                        submenu => \@submenu_split_v,
-                        sensitive => scalar(@submenu_split_v)
-                    },
-                    {
-                        label => 'Horizontally',
-                        stockicon => 'gtk-zoom-fit',
-                        submenu => \@submenu_split_h,
-                        sensitive => scalar(@submenu_split_h)
-                    }
-                ]
-            });
         }
+        # Always show Split submenu (even when already in a layout — for nested splits)
+        push(@vte_menu_items,
+        {
+            label => 'Split',
+            stockicon => 'gtk-zoom-fit',
+            sensitive => scalar(@submenu_split_v) || scalar(@submenu_split_h),
+            submenu =>
+            [
+                {
+                    label => 'Vertically',
+                    stockicon => 'gtk-zoom-fit',
+                    submenu => \@submenu_split_v,
+                    sensitive => scalar(@submenu_split_v)
+                },
+                {
+                    label => 'Horizontally',
+                    stockicon => 'gtk-zoom-fit',
+                    submenu => \@submenu_split_h,
+                    sensitive => scalar(@submenu_split_h)
+                }
+            ]
+        });
         push(@vte_menu_items, {separator => 1});
     } else {
         push(@vte_menu_items,
@@ -2810,9 +2821,9 @@ sub _tabMenu {
                 if ($uuid_tmp eq $$self{_UUID_TMP} || $PACMain::RUNNING{$uuid_tmp}{terminal}{_TITLE} eq 'Info ' || $i < 0) {
                     next;
                 }
-                if (($$self{_SPLIT} || $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT}) || (! $PACMain::RUNNING{$uuid_tmp}{terminal}{_TABBED})) {
-                    next;
-                }
+                next unless $PACMain::RUNNING{$uuid_tmp}{terminal}{_TABBED};
+                next if $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT};
+                next if $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT_OWNER};
                 push(@submenu_split_v,
                 {
                     label => "$i: $PACMain::RUNNING{$uuid_tmp}{terminal}{_TITLE}",
@@ -2836,7 +2847,7 @@ sub _tabMenu {
                 return 1;
             }});
 
-            if ($$self{_SPLIT}) {
+            if ($$self{_SPLIT} || $$self{_SPLIT_OWNER}) {
                 push(@vte_menu_items,
                 {
                     label => 'Unsplit',
@@ -2853,29 +2864,28 @@ sub _tabMenu {
                         $self->_equalresize();
                     }
                 });
-            } else {
-                push(@vte_menu_items,
-                {
-                    label => 'Split',
-                    stockicon => 'gtk-zoom-fit',
-                    sensitive => scalar(@submenu_split_v) && scalar(@submenu_split_h),
-                    submenu =>
-                    [
-                        {
-                            label => 'Vertically ',
-                            stockicon => 'gtk-zoom-fit',
-                            submenu => \@submenu_split_v,
-                            sensitive => scalar(@submenu_split_v)
-                        },
-                        {
-                            label => 'Horizontally',
-                            stockicon => 'gtk-zoom-fit',
-                            submenu => \@submenu_split_h,
-                            sensitive => scalar(@submenu_split_h)
-                        }
-                    ]
-                });
             }
+            push(@vte_menu_items,
+            {
+                label => 'Split',
+                stockicon => 'gtk-zoom-fit',
+                sensitive => scalar(@submenu_split_v) || scalar(@submenu_split_h),
+                submenu =>
+                [
+                    {
+                        label => 'Vertically ',
+                        stockicon => 'gtk-zoom-fit',
+                        submenu => \@submenu_split_v,
+                        sensitive => scalar(@submenu_split_v)
+                    },
+                    {
+                        label => 'Horizontally',
+                        stockicon => 'gtk-zoom-fit',
+                        submenu => \@submenu_split_h,
+                        sensitive => scalar(@submenu_split_h)
+                    }
+                ]
+            });
             push(@vte_menu_items, {separator => 1});
         } else {
             push(@vte_menu_items, {label => 'Attach Window to main TAB bar', stockicon => 'gtk-leave-fullscreen', code => sub {
@@ -3016,6 +3026,13 @@ sub _split {
     my $uuid_tmp = shift;
     my $vertical = shift // '0';
 
+    # --- Nested split: self is already inside a pane layout ---
+    my $parent = $$self{_GUI}{_VBOX}->get_parent();
+    if (ref($parent) && $parent->isa('Gtk3::Paned')) {
+        return $self->_splitNested($uuid_tmp, $vertical, $parent);
+    }
+
+    # --- Flat split: self is a standalone notebook tab (existing behaviour) ---
     my $tabs = $self->{_NOTEBOOK};
     $$self{_SPLIT_VERTICAL} = $vertical;
 
@@ -3068,6 +3085,12 @@ sub _split {
     $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT} = $$self{_UUID_TMP};
     $PACMain::RUNNING{$uuid_tmp}{terminal}{_POST_SPLIT} = 0;
 
+    # Track layout ownership
+    $$self{_SPLIT_OWNER}   = $$self{_UUID_TMP};
+    $$self{_SPLIT_MEMBERS} = [$$self{_UUID_TMP}, $uuid_tmp];
+    $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT_OWNER}   = $$self{_UUID_TMP};
+    $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT_MEMBERS} = [];
+
     $self->_updateCFG();
     $self->_setTabColour();
     $PACMain::RUNNING{$uuid_tmp}{terminal}->_updateCFG();
@@ -3103,8 +3126,146 @@ sub _equalresize {
     return 1;
 }
 
+# _splitWithAutoPartner — keyboard-shortcut helper.
+# Finds the first available standalone tabbed terminal and splits with it.
+sub _splitWithAutoPartner {
+    my $self = shift;
+    my $vertical = shift // 0;
+
+    foreach my $uuid_tmp (sort keys %PACMain::RUNNING) {
+        next if $uuid_tmp eq $$self{_UUID_TMP};
+        my $t = $PACMain::RUNNING{$uuid_tmp}{terminal};
+        next unless defined $t && defined $t->{_SPLIT};
+        next if $t->{_SPLIT};           # already partnered in a flat split
+        next if $t->{_SPLIT_OWNER};     # already in a nested layout
+        next unless $t->{_TABBED};      # must be tabbed (not windowed)
+        next if ($t->{_TITLE} // '') eq 'Info ';
+        $self->_split($uuid_tmp, $vertical);
+        return 1;
+    }
+    return 0;
+}
+
+# _splitNested — split a terminal that is already inside a pane layout.
+# Called by _split() when $$self{_GUI}{_VBOX}->get_parent() isa Gtk3::Paned.
+sub _splitNested {
+    my $self        = shift;
+    my $uuid_tmp    = shift;
+    my $vertical    = shift;
+    my $parent_pane = shift;    # GtkPaned directly containing my _VBOX
+
+    my $tabs        = $$self{_NOTEBOOK};
+    my $partner_t   = $PACMain::RUNNING{$uuid_tmp}{terminal};
+    my $vbox_self   = $$self{_GUI}{_VBOX};
+    my $vbox_part   = $partner_t->{_GUI}{_VBOX};
+
+    # Which slot do I occupy in the parent pane?
+    my $in_child1 = ($parent_pane->get_child1() == $vbox_self);
+
+    # Remove my VBOX from the parent pane
+    $parent_pane->remove($vbox_self);
+
+    # Detach partner from its notebook tab safely:
+    #   reparent to a temporary holder first (keeps refcount alive through remove_page)
+    my $holding_box   = Gtk3::VBox->new(0, 0);
+    my $partner_page  = $tabs->page_num($vbox_part);
+    $vbox_part->reparent($holding_box);
+    $tabs->remove_page($partner_page) if $partner_page >= 0;
+    $holding_box->remove($vbox_part);  # detach before packing into new pane
+
+    # Build the new inner pane
+    my $new_inner_pane = $vertical ? Gtk3::VPaned->new() : Gtk3::HPaned->new();
+    $new_inner_pane->pack1($vbox_self,  1, 0);
+    $new_inner_pane->pack2($vbox_part,  1, 0);
+    $new_inner_pane->show_all();
+
+    # Put new inner pane into the slot my VBOX used to occupy
+    if ($in_child1) { $parent_pane->pack1($new_inner_pane, 1, 0); }
+    else             { $parent_pane->pack2($new_inner_pane, 1, 0); }
+
+    # Update metadata
+    my $owner_uuid = $$self{_SPLIT_OWNER} || $$self{_UUID_TMP};
+    my $owner_t    = $PACMain::RUNNING{$owner_uuid}{terminal};
+
+    $$self{_SPLIT}                      = $uuid_tmp;
+    $$self{_SPLIT_VPANE}                = $new_inner_pane;
+    $partner_t->{_SPLIT}               = $$self{_UUID_TMP};
+    $partner_t->{_SPLIT_VPANE}         = $new_inner_pane;
+    $partner_t->{_SPLIT_OWNER}         = $owner_uuid;
+    $partner_t->{_SPLIT_MEMBERS}       = [];
+    $partner_t->{_TABBED}              = 1;
+    push @{$owner_t->{_SPLIT_MEMBERS}}, $uuid_tmp;
+
+    # Update the owner's tab label to list all members
+    $self->_updateSplitTabLabel();
+
+    # Equal split on the new inner pane
+    Gtk3::main_iteration() while Gtk3::events_pending();
+    my ($w, $h) = ($new_inner_pane->get_allocated_width(), $new_inner_pane->get_allocated_height());
+    $new_inner_pane->set_position((($vertical ? $h : $w) / 2) - 7);
+    Gtk3::main_iteration() while Gtk3::events_pending();
+
+    if ($$self{_CFG}{'defaults'}{'force split tabs to 50%'}) {
+        $new_inner_pane->signal_connect('size-allocate', sub {
+            my ($np, $w2, $h2) = ($new_inner_pane,
+                $new_inner_pane->get_allocated_width(),
+                $new_inner_pane->get_allocated_height());
+            $np->set_position((($vertical ? $h2 : $w2) / 2) - 7);
+        });
+    }
+
+    return 1;
+}
+
+# _updateSplitTabLabel — refresh the tab label on the owner terminal to list
+# all members. Called after any nested add/remove.
+sub _updateSplitTabLabel {
+    my $self = shift;
+
+    my $owner_uuid = $$self{_SPLIT_OWNER} || $$self{_UUID_TMP};
+    my $owner_t    = $PACMain::RUNNING{$owner_uuid}{terminal};
+    return unless defined $owner_t;
+    return unless defined $owner_t->{_GUI}{_TABLBL}{_LABEL};
+
+    my @titles;
+    foreach my $uuid (@{$owner_t->{_SPLIT_MEMBERS}}) {
+        my $t = $PACMain::RUNNING{$uuid}{terminal};
+        push @titles, (defined $t ? ($t->{_TITLE} // '?') : '?');
+    }
+
+    my $text;
+    if (@titles <= 3) {
+        $text = join(' + ', @titles);
+    } else {
+        my $extra = scalar(@titles) - 2;
+        $text = "$titles[0] + $titles[1] + $extra more";
+    }
+    $owner_t->{_GUI}{_TABLBL}{_LABEL}->set_text($text);
+}
+
+# _findNotebookPageWidget — walk up the widget tree from $widget until we
+# find the direct child of the GtkNotebook. Returns undef if not found.
+sub _findNotebookPageWidget {
+    my ($self, $widget) = @_;
+    my $tabs = $$self{_NOTEBOOK};
+    my $w = $widget;
+    while (defined $w) {
+        my $p = $w->get_parent();
+        last unless defined $p;
+        return $w if $p == $tabs;
+        $w = $p;
+    }
+    return undef;
+}
+
 sub _unsplit {
     my $self = shift;
+
+    # Nested unsplit: my VBOX is inside a pane (not directly in the notebook)
+    my $my_parent = $$self{_GUI}{_VBOX}->get_parent();
+    if (ref($my_parent) && $my_parent->isa('Gtk3::Paned')) {
+        return $self->_unsplitNested($my_parent);
+    }
 
     my $uuid_tmp = $$self{_SPLIT};
     my $tabs = $$self{_NOTEBOOK};
@@ -3207,6 +3368,10 @@ sub _unsplit {
 
     $$self{_SPLIT_VPANE} = 0;
     $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT_VPANE} = 0;
+    $$self{_SPLIT_OWNER} = 0;
+    $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT_OWNER} = 0;
+    $$self{_SPLIT_MEMBERS} = [];
+    $PACMain::RUNNING{$uuid_tmp}{terminal}{_SPLIT_MEMBERS} = [];
 
     $$self{_NOTEBOOK}->remove_page($page);
 
@@ -3215,6 +3380,104 @@ sub _unsplit {
     $self->_updateCFG();
     $PACMain::RUNNING{$uuid_tmp}{terminal}->_updateCFG();
 
+    return 1;
+}
+
+# _unsplitNested — remove self from a nested pane layout.
+# Promotes the sibling subtree to replace the parent pane.
+sub _unsplitNested {
+    my $self        = shift;
+    my $parent_pane = shift;   # GtkPaned directly containing my _VBOX
+
+    my $tabs     = $$self{_NOTEBOOK};
+    my $my_vbox  = $$self{_GUI}{_VBOX};
+
+    # Identify sibling (the other child of parent_pane)
+    my $in_child1 = ($parent_pane->get_child1() == $my_vbox);
+    my $sibling   = $in_child1 ? $parent_pane->get_child2() : $parent_pane->get_child1();
+
+    # Identify grandparent
+    my $grandparent = $parent_pane->get_parent();
+
+    # Remove both children from parent_pane before we replace it
+    $parent_pane->remove($my_vbox);
+    $parent_pane->remove($sibling);
+
+    if ($grandparent == $tabs) {
+        # Parent pane is the direct notebook page — replace it with sibling
+        my $page_num   = $tabs->page_num($parent_pane);
+        my $tab_label  = $tabs->get_tab_label($parent_pane);
+        $tabs->remove_page($page_num);
+        $tabs->insert_page($sibling, $tab_label, $page_num);
+        $tabs->set_tab_reorderable($sibling, 1);
+        $tabs->show_all();
+    } elsif (ref($grandparent) && $grandparent->isa('Gtk3::Paned')) {
+        # Parent pane is itself nested — replace it in grandparent with sibling
+        my $gp_in_child1 = ($grandparent->get_child1() == $parent_pane);
+        $grandparent->remove($parent_pane);
+        if ($gp_in_child1) { $grandparent->pack1($sibling, 1, 0); }
+        else                { $grandparent->pack2($sibling, 1, 0); }
+        $grandparent->show_all();
+    }
+
+    # Promote self to a new standalone tab
+    my $new_vbox = Gtk3::VBox->new(0, 0);
+    $my_vbox->reparent($new_vbox);
+    $$self{_GUI}{_VBOX} = $new_vbox;
+    $$self{_TABBED} = 1;
+
+    $$self{_GUI}{_TABLBL} = Gtk3::HBox->new(0, 0);
+    $$self{_GUI}{_TABLBL}{_EBLBL} = Gtk3::EventBox->new();
+    $$self{_GUI}{_TABLBL}->pack_start($$self{_GUI}{_TABLBL}{_EBLBL}, 1, 1, 0);
+    $$self{_GUI}{_TABLBL}{_LABEL} = Gtk3::Label->new($$self{_TITLE});
+    $$self{_GUI}{_TABLBL}{_EBLBL}->add($$self{_GUI}{_TABLBL}{_LABEL});
+
+    my $eblbl1 = Gtk3::EventBox->new();
+    $eblbl1->add(Gtk3::Image->new_from_stock('gtk-close', 'menu'));
+    $eblbl1->signal_connect('button_release_event' => sub {
+        return 0 if $_[1]->button != 1;
+        $self->stop(undef, 1);
+    });
+    $$self{_GUI}{_TABLBL}->pack_start($eblbl1, 0, 1, 0);
+    $$self{_GUI}{_TABLBL}{_EBLBL}->signal_connect('button_press_event' => sub {
+        my ($w, $ev) = @_;
+        if ($ev->button eq 2) { $self->stop(undef, 1); return 1; }
+        elsif ($ev->button eq 3) { $self->_tabMenu($ev); return 1; }
+        return 0;
+    });
+    $$self{_GUI}{_TABLBL}->show_all();
+    $tabs->append_page($new_vbox, $$self{_GUI}{_TABLBL});
+    $tabs->show_all();
+    $tabs->set_tab_reorderable($new_vbox, 1);
+    $self->_setupTabDND();
+
+    # Update owner's member list and tab label
+    my $owner_uuid = $$self{_SPLIT_OWNER};
+    if ($owner_uuid) {
+        my $owner_t = $PACMain::RUNNING{$owner_uuid}{terminal};
+        if (defined $owner_t) {
+            my $my_uuid = $$self{_UUID_TMP};
+            @{$owner_t->{_SPLIT_MEMBERS}} = grep { $_ ne $my_uuid } @{$owner_t->{_SPLIT_MEMBERS}};
+            # If only 1 member left, collapse the layout entirely
+            if (scalar(@{$owner_t->{_SPLIT_MEMBERS}}) <= 1) {
+                $owner_t->{_SPLIT}       = 0;
+                $owner_t->{_SPLIT_OWNER} = 0;
+                $owner_t->{_SPLIT_MEMBERS} = [];
+            } else {
+                $self->_updateSplitTabLabel();
+            }
+        }
+    }
+
+    $$self{_SPLIT}       = 0;
+    $$self{_SPLIT_VPANE} = 0;
+    $$self{_SPLIT_OWNER} = 0;
+    $$self{_SPLIT_MEMBERS} = [];
+    $$self{_POST_SPLIT}  = $new_vbox;
+
+    Gtk3::main_iteration() while Gtk3::events_pending();
+    $tabs->set_current_page(-1);
+    $self->_updateCFG();
     return 1;
 }
 

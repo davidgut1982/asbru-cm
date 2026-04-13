@@ -528,6 +528,9 @@ sub _getDefaultConfig {
     $$cfg{'terminal'}{'Ctrl+0'}        = ['Terminal',          'zoomreset',           'Zoom reset text'];
     $$cfg{'terminal'}{'Ctrl+ampersand'}= ['Terminal',          'cisco',               'Send Cisco interrupt keypress'];
     $$cfg{'terminal'}{'AltCtrl+s'}     = ['Terminal',          'sftp',                'Open SFTP session'];
+    $$cfg{'terminal'}{'CtrlShift+h'}   = ['Terminal',          'split-h',             'Split terminal horizontally'];
+    $$cfg{'terminal'}{'CtrlShift+v'}   = ['Terminal',          'split-v',             'Split terminal vertically'];
+    $$cfg{'terminal'}{'CtrlShift+w'}   = ['Terminal',          'unsplit',             'Unsplit terminal'];
 
     return $cfg;
 }
